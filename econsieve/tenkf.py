@@ -3,6 +3,7 @@
 
 import numpy as np
 from functools import partial
+from inspect import Parameter, signature
 from scipy.linalg import sqrtm
 from scipy.stats.qmc import MultivariateNormalQMC, LatinHypercube
 from grgrlib.linalg import tinv, nearest_psd
@@ -11,17 +12,32 @@ from .stats import logpdf
 
 def multivariate_dispatch(engine):
 
-    def multivariate(mean, cov, size):
+    # Override a pre-bound seed (or rng) without changing other factory options.
+    params = signature(engine).parameters
+    if 'rng' in params and not (isinstance(engine, partial) and 'seed' in engine.keywords):
+        seed_kw = 'rng'
+    elif 'seed' in params or any(p.kind == Parameter.VAR_KEYWORD for p in params.values()):
+        seed_kw = 'seed'
+    else:
+        seed_kw = None
+
+    def multivariate(mean, cov, size, stream=None):
         ndim = len(mean)
         size = (size,) if isinstance(size, int) else size
         nsample = np.prod(size)
 
         # define target distribution
         scov = np.real(sqrtm(cov))
-        dist = MultivariateNormalQMC(mean, cov_root=scov, engine=engine(ndim))
+        options = {}
+        if stream is not None and seed_kw is not None:
+            options[seed_kw] = int(stream.integers(2**32))
+        dist = MultivariateNormalQMC(mean, cov_root=scov, engine=engine(ndim, **options))
 
         # draw sample
         res = dist.random(nsample)
+        if stream is not None:
+            # Pair points independently, even for engines with fixed point order.
+            stream.shuffle(res, axis=0)
         return np.reshape(res, (*size, ndim))
 
     return multivariate
@@ -55,7 +71,10 @@ class TEnKF(object):
     def batch_filter(self, Z, init_states=None, seed=None, store=False, calc_ll=False, verbose=False):
         """Batch filter.
 
-        Runs the TEnKF on the full dataset.
+        Runs the TEnKF on the full dataset. The call seed overrides the filter
+        seed (default 0). A custom QMC factory may accept a seed or rng keyword.
+        A dimension-only factory must return reproducible points for repeatable
+        results; the filter independently shuffles them for each stream.
         """
 
         # store time series for later
@@ -77,20 +96,21 @@ class TEnKF(object):
 
         ll = 0
 
-        if seed is not None:
-            np.random.seed(seed)
-        elif self.seed is not None:
-            np.random.seed(self.seed)
+        seed = self.seed if seed is None else seed
+        children = np.random.SeedSequence(0 if seed is None else seed).spawn(3)
+        process_rng, measurement_rng, initial_rng = map(np.random.default_rng, children)
 
         means = np.empty((Z.shape[0], dim_x))
         covs = np.empty((Z.shape[0], dim_x, dim_x))
         Y = np.empty((dim_z, N))
 
-        mus = self.multivariate(mean=np.zeros(
-            self.dim_z), cov=self.R, size=(len(Z), self.N))
-        epss = self.multivariate(mean=np.zeros(
-            self.dim_z), cov=self.Q, size=(len(Z), self.N))
-        X = init_states or self.multivariate(mean=self.x, cov=self.P, size=N).T
+        size = (len(Z), N)
+        epss = self.multivariate(np.zeros(self.Q.shape[0]), self.Q, size, stream=process_rng)
+        mus = self.multivariate(np.zeros(dim_z), self.R, size, stream=measurement_rng)
+        if init_states is None:
+            X = self.multivariate(self.x, self.P, N, stream=initial_rng).T
+        else:
+            X = np.array(init_states, dtype=float, copy=True)
 
         self.Xs = np.empty((Z.shape[0], dim_x, N))
 
@@ -115,20 +135,17 @@ class TEnKF(object):
             Y_bar = Y @ I2
             ZZ = np.outer(z, I1)
             S = np.cov(Y) + self.R
+            if calc_ll:
+                # Evaluate the forecast before updating X: Y can be a view of X.
+                y = z - np.mean(Y, axis=1)
+                ll += logpdf(x=y, mean=np.zeros(dim_z), cov=S)
             X += X_bar @ Y_bar.T @ np.linalg.inv((N-1)
                                                  * S) @ (ZZ - Y - mus[nz].T)
 
             if store:
                 self.X_bar_priors[nz, :, :] = X_bar
                 self.X_bars[nz, :, :] = X @ I2
-                self.Xs[nz, :, :] = X
-
-            if calc_ll:
-                # cummulate ll
-                z_mean = np.mean(Y, axis=1)
-                y = z - z_mean
-                ll += logpdf(x=y, mean=np.zeros(dim_z), cov=S)
-            else:
+            if store or not calc_ll:
                 self.Xs[nz, :, :] = X
 
         if calc_ll:
