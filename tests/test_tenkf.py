@@ -32,6 +32,22 @@ def test_two_period_log_likelihood():
     assert ll == pytest.approx(exact, abs=0.20)
 
 
+def test_log_likelihood_with_small_positive_measurement_variance():
+    # Identical observation forecasts have zero sample covariance, so S = R exactly.
+    def zero_observations(states):
+        return np.zeros((len(states), 3))
+
+    filt = TEnKF(8, 1, 3, fx=lambda x, eps: (eps,), hx=zero_observations, seed=42)
+    filt.R = np.diag([1.0, 1.0, 1e-12])
+
+    ll_a = filt.batch_filter(np.array([[0.0, 0.0, 0.0]]), calc_ll=True)
+    ll_b = filt.batch_filter(np.array([[0.0, 0.0, 0.01]]), calc_ll=True)
+
+    expected_a = -0.5 * (3 * np.log(2 * np.pi) + np.log(1e-12))
+    np.testing.assert_allclose(ll_a, expected_a, rtol=0, atol=1e-12)
+    np.testing.assert_allclose(ll_b - ll_a, -50_000_000, rtol=0, atol=1e-7)
+
+
 @pytest.mark.parametrize("engine", [
     None,
     partial(LatinHypercube, scramble=False, seed=7),
