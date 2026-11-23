@@ -9,6 +9,37 @@ from grgrlib.optimize import cmaes
 from .stats import logpdf
 
 
+def _ensemble_score(points):
+    """Whiten differences on the empirical affine support of an ensemble."""
+    anomalies = points - points.mean(axis=0)
+    scale = np.max(np.abs(anomalies), axis=0)
+    scale[scale == 0] = 1
+    _, values, directions = np.linalg.svd(anomalies / scale, full_matrices=False)
+    cutoff = max(points.shape) * np.finfo(float).eps
+    keep = values > cutoff * values[0]
+    if keep.all() and len(values) == points.shape[1] and values[-1] > np.finfo(float).eps**0.25 * values[0]:
+        return None
+    basis = directions[keep]
+    std = values[keep] / np.sqrt(len(points) - 1)
+    location_scale = np.max(np.abs(points), axis=0) / scale
+    null_projector = np.abs(np.eye(len(scale)) - basis.T @ basis)
+    abs_basis = np.abs(basis)
+
+    def score(state, target):
+        diff = (state - target) / scale
+        coords = basis @ diff
+        if len(coords) < len(diff):
+            residual = diff - coords @ basis
+            propagation = null_projector @ (location_scale + np.abs(diff))
+            tolerance = cutoff * (propagation + np.abs(diff) + np.abs(coords) @ abs_basis)
+            if np.any(np.abs(residual) > tolerance):
+                return np.inf
+        # CMA-ES compares candidates at a fixed date; the normalizer is constant.
+        return 0.5 * np.sum((coords / std)**2)
+
+    return score
+
+
 def npas(self, func=None, X=None, init_states=None, vals=None, covs=None, nsamples=False, bound_sigma=4, frtol=1e-5, seed=0, verbose=True, **cmaes_args):
     """Nonlinear Path-Adjustment Smoother. 
 
@@ -50,20 +81,22 @@ def npas(self, func=None, X=None, init_states=None, vals=None, covs=None, nsampl
     if X is None:
         X = np.rollaxis(self.Ss, 2)
 
+    scores = [None] * X.shape[1]
     if covs is None:
         covs = np.empty((X.shape[1], X.shape[2], X.shape[2]))
         for i in range(X.shape[1]):
             covs[i, :, :] = np.cov(X[:, i, :].T)
+            scores[i] = _ensemble_score(X[:, i, :])
 
     bound = np.sqrt(np.diag(self.Q))*bound_sigma
 
-    def target(eps, x, mean, cov):
+    def target(eps, x, mean, cov, score):
 
         state, flag = func(x, 2*bound*eps)
         if flag:
             return np.inf
 
-        return -logpdf(state, mean=mean, cov=cov)
+        return score(state, mean) if score is not None else -logpdf(state, mean=mean, cov=cov)
 
     wrap = tqdm if verbose else lambda x: x
     owrap = wrap if nsamples > 1 else lambda x: x
@@ -88,7 +121,7 @@ def npas(self, func=None, X=None, init_states=None, vals=None, covs=None, nsampl
 
         for t in iwrap(range(s.shape[0] - 1)):
 
-            def func_cmaes(eps): return target(eps, x, s[t+1], covs[t+1])
+            def func_cmaes(eps): return target(eps, x, s[t+1], covs[t+1], scores[t+1])
 
             eps0 = np.zeros(self.dim_z)
 
