@@ -51,6 +51,11 @@ def test_exact_redundant_measurement_checks_affine_support():
     assert ll == pytest.approx(norm.logpdf(2*np.sqrt(2.), scale=np.sqrt(2.)))
     np.testing.assert_allclose(filt.Xs, 2.)
     assert filt.batch_filter(np.array([[2., 1.]]), init_states=x, calc_ll=True) == -np.inf
+    observations = np.array([[2., 2.], [2., 1.], [2., 2.]])
+    parts = np.zeros(len(observations))
+    assert filt.batch_filter(observations, init_states=x, calc_ll=True, ll_contributions=parts) == -np.inf
+    np.testing.assert_equal(parts, [ll, -np.inf, np.nan])
+
     with pytest.raises(ValueError, match="outside the forecast support"):
         filt.batch_filter(np.array([[2., 1.]]), init_states=x)
 
@@ -81,6 +86,11 @@ def test_two_period_log_likelihood():
     filt.P[:] = 0  # Start at x_0 = 0, so x_1 = eps_1.
     observations = np.array([[2.0], [-3.2]])
     ll = filt.batch_filter(observations, calc_ll=True)
+
+    parts = np.full(len(observations), np.nan)
+    assert filt.batch_filter(observations, calc_ll=True, ll_contributions=parts) == ll
+    assert sum(parts) == ll
+    assert parts[0] == pytest.approx(norm.logpdf(2.0, scale=np.sqrt(2)), abs=0.1)
 
     # y_2 | y_1 has mean 0.8 and variance 0.8**2 * 0.5 + Q + R.
     exact = norm.logpdf(2.0, scale=np.sqrt(2)) + norm.logpdf(-3.2, 0.8, np.sqrt(2.32))

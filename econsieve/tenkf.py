@@ -133,7 +133,8 @@ class TEnKF(object):
         self.multivariate = multivariate_dispatch(qmc_engine)
 
 
-    def batch_filter(self, Z, init_states=None, seed=None, store=False, calc_ll=False, verbose=False):
+    def batch_filter(self, Z, init_states=None, seed=None, store=False, calc_ll=False, verbose=False,
+                     *, ll_contributions=None):
         """Batch filter.
 
         Runs the TEnKF on the full dataset. The call seed overrides the filter
@@ -141,6 +142,13 @@ class TEnKF(object):
         A dimension-only factory must return reproducible points for repeatable
         results; the filter independently shuffles them for each stream.
         """
+
+        # Optional caller-owned float64 buffer. Preserve the evaluated prefix on rejection.
+        if ll_contributions is not None:
+            if (not calc_ll or not isinstance(ll_contributions, np.ndarray)
+                    or ll_contributions.dtype != np.float64 or ll_contributions.shape != (len(Z),)):
+                raise ValueError("ll_contributions requires calc_ll and one float64 entry per observation.")
+            ll_contributions.fill(np.nan)
 
         # store time series for later
         self.Z = Z
@@ -220,6 +228,8 @@ class TEnKF(object):
                 condition = np.inf if inverse is None else np.sum(np.abs(scaled_cov * inverse.T))
                 if not np.isfinite(condition) or condition > 1 / np.sqrt(np.finfo(float).eps):
                     update, contribution = _factor_update(X, Y, z, mus[nz].T, noise_root, positive_noise, calc_ll)
+                    if ll_contributions is not None:
+                        ll_contributions[nz] = contribution
                     if update is None:
                         if calc_ll and not store:
                             self.ll = -np.inf
@@ -230,7 +240,10 @@ class TEnKF(object):
                 else:
                     if calc_ll:
                         y = z - np.mean(Y, axis=1)
-                        ll += logpdf(x=y, mean=np.zeros(dim_z), cov=S)
+                        contribution = logpdf(x=y, mean=np.zeros(dim_z), cov=S)
+                        if ll_contributions is not None:
+                            ll_contributions[nz] = contribution
+                        ll += contribution
                     X += X_bar @ Y_bar.T @ inverse @ (ZZ - Y - mus[nz].T)
                 if not np.isfinite(X).all() or np.isnan(ll) or np.isposinf(ll):
                     raise ForecastNumericalError(f"Non-finite ensemble update at observation {nz}.")
