@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 from mpmath import mp
 
-from econsieve import TEnKF
+from econsieve import ForecastPrecisionRequired, TEnKF
 
 
 def reference_update(states, forecasts, observation, perturbations, covariance):
@@ -53,7 +53,8 @@ def extreme_forecast():
                            ll_contributions=parts)
     assert parts[0] == ll == filt.ll
     assert filt.fallback_decimal_digits == 200
-    assert filt.high_precision_updates == 1
+    assert filt.precision_requests == filt.high_precision_updates == filt.high_precision_completed == 1
+    assert filt.high_precision_seconds > 0
     return ll, expected_ll, filt.Xs[0], expected_states
 
 
@@ -83,11 +84,24 @@ def test_scalar_state_cancellation_with_and_without_fallback():
     updated, count = run(np.int64(80))
     np.testing.assert_array_equal(updated, np.ones(3))
     assert count == 1
-    legacy, count = run(None)
-    assert count == 0
-    # Float64 cannot represent the needed correction 1 - 1e17.
-    assert legacy[-1] != 1.
+    with pytest.raises(ForecastPrecisionRequired, match="Observation 0"):
+        run(None)
     assert mp.dps == precision
+
+
+def test_disabled_retry_keeps_checks_and_only_counts_work_for_the_current_call():
+    filt = TEnKF(3, 1, 1, fx=lambda state, eps: (state,), hx=lambda states: states,
+                 fallback_decimal_digits=None)
+    filt.multivariate = lambda mean, cov, size, **kwargs: np.zeros((*size, len(mean)))
+    parts = np.empty(1)
+    z = np.array([[1.]])
+    with pytest.raises(ForecastPrecisionRequired, match="Observation 0"):
+        filt.batch_filter(z, init_states=np.array([[-1e17, 0., 1e17]]), calc_ll=True, ll_contributions=parts)
+    assert np.isnan(parts[0])
+    assert filt.precision_requests == 1
+    assert filt.high_precision_updates == filt.high_precision_completed == filt.high_precision_seconds == 0
+    assert np.isfinite(filt.batch_filter(z, init_states=np.array([[1., 2., 3.]]), calc_ll=True))
+    assert filt.precision_requests == filt.high_precision_updates == filt.high_precision_seconds == 0
 
 
 @pytest.mark.parametrize("digits", [0, -5, 50.5, True, "200"])

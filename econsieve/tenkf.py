@@ -4,6 +4,7 @@
 import numpy as np
 from functools import partial
 from inspect import Parameter, signature
+from time import perf_counter
 from scipy.linalg import sqrtm, solve_triangular
 from scipy.stats.qmc import MultivariateNormalQMC, LatinHypercube
 from grgrlib.linalg import tinv
@@ -17,6 +18,10 @@ _RETRY_IN_HIGH_PRECISION = object()
 
 class ForecastNumericalError(ArithmeticError):
     """The ensemble forecast could not be evaluated reliably in finite precision."""
+
+
+class ForecastPrecisionRequired(ForecastNumericalError):
+    """This observation needs a high-precision update, which the caller disabled."""
 
 
 def _measurement_root(R, dim):
@@ -37,7 +42,7 @@ def _measurement_root(R, dim):
         return scale[:, None] * vectors[:, values > tol] * np.sqrt(values[values > tol]), False
 
 
-def _factor_update(X, Y, z, noise, root, positive_noise, calc_ll, check_precision=False):
+def _factor_update(X, Y, z, noise, root, positive_noise, calc_ll):
     """Condition using a factor of cov(Y) + R before rounding can erase R."""
     n = X.shape[1]
     mean = Y.mean(axis=1)
@@ -52,7 +57,7 @@ def _factor_update(X, Y, z, noise, root, positive_noise, calc_ll, check_precisio
     residuals = ((z[:, None] - Y) - noise) / scale[:, None]
     if positive_noise:
         q, upper = np.linalg.qr(factor.T, mode="reduced")
-        if check_precision and np.linalg.cond(upper) > 1 / _SQRT_EPS:
+        if np.linalg.cond(upper) > 1 / _SQRT_EPS:
             return _RETRY_IN_HIGH_PRECISION, None
         whiten = partial(solve_triangular, upper.T, lower=True)
         update = (xc @ q[:n]) @ whiten(residuals)
@@ -63,7 +68,7 @@ def _factor_update(X, Y, z, noise, root, positive_noise, calc_ll, check_precisio
         rank = len(z)
     else:
         u, s, vt = np.linalg.svd(factor, full_matrices=False)
-        if check_precision and s[-1] < _SQRT_EPS * s[0]:
+        if s[-1] < _SQRT_EPS * s[0]:
             return _RETRY_IN_HIGH_PRECISION, None
         eps = np.finfo(float).eps
         keep = s > max(factor.shape) * eps * s[0]
@@ -123,7 +128,7 @@ class TEnKF(object):
 
     fallback_decimal_digits sets the number of significant decimal digits used
     to recompute a numerically suspect observation update (default 200).
-    None disables the precision checks and retains Float64 arithmetic.
+    None keeps the checks and raises ForecastPrecisionRequired if a retry is needed.
     """
 
     name = 'TEnKF'
@@ -145,7 +150,10 @@ class TEnKF(object):
                 raise ValueError("fallback_decimal_digits must be a positive integer or None.")
             fallback_decimal_digits = int(fallback_decimal_digits)
         self.fallback_decimal_digits = fallback_decimal_digits
+        self.precision_requests = 0
         self.high_precision_updates = 0
+        self.high_precision_completed = 0
+        self.high_precision_seconds = 0.0
 
         self.R = np.eye(self.dim_z)
         self.Q = np.eye(self.dim_x)
@@ -168,8 +176,10 @@ class TEnKF(object):
         results; the filter independently shuffles them for each stream.
         """
 
+        self.precision_requests = 0
         self.high_precision_updates = 0
-        check_precision = self.fallback_decimal_digits is not None
+        self.high_precision_completed = 0
+        self.high_precision_seconds = 0.0
 
         # Optional caller-owned float64 buffer. Preserve the evaluated prefix on rejection.
         if ll_contributions is not None:
@@ -257,7 +267,7 @@ class TEnKF(object):
                 contribution = 0.
                 if not np.isfinite(condition) or condition > 1 / _SQRT_EPS:
                     update, contribution = _factor_update(
-                        X, Y, z, mus[nz].T, noise_root, positive_noise, calc_ll, check_precision)
+                        X, Y, z, mus[nz].T, noise_root, positive_noise, calc_ll)
                 else:
                     if calc_ll:
                         y = z - np.mean(Y, axis=1)
@@ -269,10 +279,17 @@ class TEnKF(object):
                     updated = X + update
                     # Losing half the significand in X + update can erase a
                     # member's posterior state even in a scalar observation.
-                    retry = check_precision and (not np.isfinite(updated).all()
-                                                 or np.any(np.abs(updated) < _SQRT_EPS * np.abs(X)))
+                    retry = (not np.isfinite(updated).all()
+                             or np.any(np.abs(updated) < _SQRT_EPS * np.abs(X)))
                 if retry:
+                    self.precision_requests += 1
+                    if self.fallback_decimal_digits is None:
+                        raise ForecastPrecisionRequired(
+                            f"Observation {nz} requires a high-precision forecast update "
+                            "with fallback_decimal_digits=None."
+                        )
                     self.high_precision_updates += 1
+                    started = perf_counter()
                     try:
                         updated, contribution = precise_update(
                             X, Y, z, mus[nz].T, self.R, positive_noise, calc_ll, self.fallback_decimal_digits)
@@ -280,6 +297,10 @@ class TEnKF(object):
                         raise ForecastNumericalError(
                             f"Ensemble update at observation {nz} failed at "
                             f"{self.fallback_decimal_digits} decimal digits: {exc}") from exc
+                    else:
+                        self.high_precision_completed += 1
+                    finally:
+                        self.high_precision_seconds += perf_counter() - started
                 if ll_contributions is not None:
                     ll_contributions[nz] = contribution
                 if updated is None:

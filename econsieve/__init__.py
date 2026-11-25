@@ -17,7 +17,7 @@ for more information.
 """
 
 from .npas import npas
-from .tenkf import TEnKF
+from .tenkf import ForecastPrecisionRequired, TEnKF
 from .ukf import *
 from .sigma_points import *
 from .kalman_filter import *

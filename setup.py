@@ -30,6 +30,7 @@ setup(
             'scipy',
             'numpy',
             'numba',
+            'tqdm',
             'grgrlib>=0.1.13',
          ],
    )

@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "econsieve"
+# setup.py supplies the distribution metadata for this checkout.
+dynamic = [
+    "version", "description", "readme", "authors", "license", "classifiers",
+    "urls", "dependencies", "optional-dependencies",
+]
+
+[dependency-groups]
+dev = ["pytest"]
+
+[tool.uv.sources]
+grgrlib = { path = "../grgrlib", editable = true }

@@ -31,10 +31,26 @@ digits. It uses the original forecast ensemble and the same measurement draws,
 then rounds the updated ensemble and score to Float64. These checks are
 heuristics. Precision already lost in the supplied forecasts cannot be recovered.
 
-Set ``fallback_decimal_digits=None`` to disable the additional checks and use
-the previous Float64 update throughout. After ``batch_filter``,
-``filter.high_precision_updates`` counts the observations for which a
-high-precision update was attempted during that call.
+With ``fallback_decimal_digits=None``, the same checks run and an observation
+that requires a retry raises ``ForecastPrecisionRequired``. Each call to
+``batch_filter`` resets four counters on the filter: ``precision_requests``,
+``high_precision_updates`` (attempts), ``high_precision_completed``, and
+``high_precision_seconds`` (elapsed time spent in attempts, including failures).
+They also describe the evaluated prefix when a call raises.
+
+Developing with the local grgrlib fork
+--------------------------------------
+
+Put the grgrlib fork in a sibling directory named ``grgrlib``. From the
+EconSieve checkout, run:
+
+.. code-block:: bash
+
+   uv sync --locked
+   uv run --locked pytest -q
+
+This installs both checkouts in editable mode in EconSieve's ``.venv``.
+Edits to either package are picked up the next time Python starts.
 
 Installation with ``pip``
 -------------------------------------------------------
