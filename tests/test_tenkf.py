@@ -41,6 +41,7 @@ def test_well_conditioned_update_and_likelihood_match_original_arithmetic():
     expected = x + anomalies @ anomalies.T @ np.linalg.inv(3*S) @ (z[:, None] - x - measurement_noise.T)
     assert filt.batch_filter(z[None], init_states=x, calc_ll=True, store=True) == logpdf(z - x.mean(1), np.zeros(2), S)
     np.testing.assert_array_equal(filt.Xs[0], expected)
+    assert filt.high_precision_updates == 0
 
 
 def test_exact_redundant_measurement_checks_affine_support():

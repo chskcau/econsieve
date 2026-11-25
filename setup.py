@@ -22,9 +22,11 @@ setup(
             "Programming Language :: Python :: 3.9",
         ],
         include_package_data=True,
+        extras_require={"test": ["pytest"]},
         packages = find_packages(),
         install_requires=[
             'matplotlib',
+            'mpmath',
             'scipy',
             'numpy',
             'numba',

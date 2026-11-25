@@ -20,6 +20,22 @@ NPAS is built from scratch. I barely did any testing as a standalone filter and 
 
 Some very rudimentary documentation `can be found here <https://econsieve.readthedocs.io/en/latest/readme.html>`_.
 
+TEnKF precision
+---------------
+
+``TEnKF(..., fallback_decimal_digits=200)`` normally uses Float64. When the
+scaled forecast factor is severely ill-conditioned or a correction nearly
+cancels a member's forecast state, the filter recomputes that observation's
+update and requested log-likelihood with the given number of significant decimal
+digits. It uses the original forecast ensemble and the same measurement draws,
+then rounds the updated ensemble and score to Float64. These checks are
+heuristics. Precision already lost in the supplied forecasts cannot be recovered.
+
+Set ``fallback_decimal_digits=None`` to disable the additional checks and use
+the previous Float64 update throughout. After ``batch_filter``,
+``filter.high_precision_updates`` counts the observations for which a
+high-precision update was attempted during that call.
+
 Installation with ``pip``
 -------------------------------------------------------
 
