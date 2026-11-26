@@ -152,3 +152,35 @@ def test_replay_with_sampled_initial_states_and_custom_factory():
     assert filt.batch_filter(observations, calc_ll=True, store=True) == first_ll
     np.testing.assert_array_equal(filt.Xs, first_ensemble)
     assert seeds[-3:] == seeds[:3]
+
+
+def test_supplied_initial_root_preserves_a_weak_direction_and_the_draw_streams():
+    filt = TEnKF(16, 2, 2, fx=lambda state, eps: (state,), hx=observe, seed=7)
+    # Squaring this symmetric root in binary64 loses the small eigenvalue.
+    root = np.full((2, 2), 0.5) + 5e-11 * np.array([[1., -1.], [-1., 1.]])
+    filt.P = root.T @ root
+    original = filt.multivariate
+    draws = []
+
+    def capture(*args, **kwargs):
+        sample = original(*args, **kwargs)
+        draws.append(sample.copy())
+        return sample
+
+    filt.multivariate = capture
+    obs = np.zeros((1, 2))
+    filt.batch_filter(obs, initial_cov_root=root)
+    q, r, initial = draws
+    initial_stream = np.random.default_rng(np.random.SeedSequence(7).spawn(3)[2])
+    normals = original(np.zeros(2), np.eye(2), 16, stream=initial_stream)
+    np.testing.assert_allclose(initial, normals @ root, atol=1e-15, rtol=1e-15)
+    assert np.max(abs(initial[:, 1] - initial[:, 0])) > 1e-10
+    draws.clear()
+    filt.batch_filter(obs)
+    np.testing.assert_array_equal(draws[0], q)
+    np.testing.assert_array_equal(draws[1], r)
+
+    with pytest.raises(ValueError, match="either init_states"):
+        filt.batch_filter(obs, init_states=initial.T, initial_cov_root=root)
+    with pytest.raises(ValueError, match="finite square factor"):
+        filt.batch_filter(obs, initial_cov_root=np.full((1, 2), np.nan))

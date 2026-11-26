@@ -100,13 +100,15 @@ def multivariate_dispatch(engine):
     else:
         seed_kw = None
 
-    def multivariate(mean, cov, size, stream=None):
+    def multivariate(mean, cov, size, stream=None, cov_root=None):
         ndim = len(mean)
         size = (size,) if isinstance(size, int) else size
         nsample = np.prod(size)
 
         # define target distribution
-        scov = np.real(sqrtm(cov)) if np.any(cov) else np.zeros_like(cov)
+        scov = cov_root
+        if scov is None:
+            scov = np.real(sqrtm(cov)) if np.any(cov) else np.zeros_like(cov)
         options = {}
         if stream is not None and seed_kw is not None:
             options[seed_kw] = int(stream.integers(2**32))
@@ -129,17 +131,22 @@ class TEnKF(object):
     fallback_decimal_digits sets the number of significant decimal digits used
     to recompute a numerically suspect observation update (default 200).
     None keeps the checks and raises ForecastPrecisionRequired if a retry is needed.
+    precise_forecast, when supplied, takes the previous member states (dim_x, N)
+    and exactly the same process draws (N, dim_eps). It returns the unrounded
+    state and observation forecasts in (dimension, N) order and must be deterministic.
     """
 
     name = 'TEnKF'
+    precise_forecast = None  # Also the default for previously serialized filters.
 
     def __init__(self, N, dim_x=None, dim_z=None, fx=None, hx=None, qmc_engine=None, seed=None,
-                 *, fallback_decimal_digits=200):
+                 *, fallback_decimal_digits=200, precise_forecast=None):
 
         self.dim_x = dim_x
         self.dim_z = dim_z
         self.t_func = fx
         self.o_func = hx
+        self.precise_forecast = precise_forecast
 
         self.N = N
         self.seed = seed
@@ -167,11 +174,15 @@ class TEnKF(object):
 
 
     def batch_filter(self, Z, init_states=None, seed=None, store=False, calc_ll=False, verbose=False,
-                     *, ll_contributions=None):
+                     *, ll_contributions=None, precise_forecast=None, initial_cov_root=None):
         """Batch filter.
 
         Runs the TEnKF on the full dataset. The call seed overrides the filter
         seed (default 0). A custom QMC factory may accept a seed or rng keyword.
+        A call-specific precise_forecast overrides the constructor callback.
+        initial_cov_root may supply a square right factor S of the stationary
+        covariance (S.T @ S = P) for the initial QMC draws. This preserves
+        information available to a model that formed P from smaller factors.
         A dimension-only factory must return reproducible points for repeatable
         results; the filter independently shuffles them for each stream.
         """
@@ -224,16 +235,26 @@ class TEnKF(object):
         size = (len(Z), N)
         epss = self.multivariate(np.zeros(self.Q.shape[0]), self.Q, size, stream=process_rng)
         mus = self.multivariate(np.zeros(dim_z), self.R, size, stream=measurement_rng)
-        if init_states is None:
+        if initial_cov_root is not None:
+            if init_states is not None:
+                raise ValueError("Specify either init_states or initial_cov_root.")
+            root = np.asarray(initial_cov_root, dtype=float)
+            if root.shape != (dim_x, dim_x) or not np.isfinite(root).all():
+                raise ValueError("initial_cov_root must be a finite square factor of P.")
+            X = self.multivariate(self.x, self.P, N, stream=initial_rng, cov_root=root).T
+        elif init_states is None:
             X = self.multivariate(self.x, self.P, N, stream=initial_rng).T
         else:
             X = np.array(init_states, dtype=float, copy=True)
 
         self.Xs = np.empty((Z.shape[0], dim_x, N))
+        forecast_again = self.precise_forecast if precise_forecast is None else precise_forecast
+        noise_scale = np.sqrt(self.R.diagonal())
 
         for nz, z in enumerate(Z):
 
             # predict
+            prior_members = X.copy() if forecast_again is not None else None
             for i in range(N):
                 eps = epss[nz, i]
                 if self.o_func is None:
@@ -261,11 +282,11 @@ class TEnKF(object):
                     inverse = np.linalg.inv(scaled_cov) if np.isfinite(scaled_cov).all() else None
                 except np.linalg.LinAlgError:
                     inverse = None
-                # This componentwise condition estimate is invariant to changes
-                # of observation units. Keep the original well-conditioned path.
+                # The inverse is applied to a Gram matrix. Switch to its QR
+                # factor before moderate conditioning contaminates later states.
                 condition = np.inf if inverse is None else np.sum(np.abs(scaled_cov * inverse.T))
                 contribution = 0.
-                if not np.isfinite(condition) or condition > 1 / _SQRT_EPS:
+                if not np.isfinite(condition) or condition > 1 / np.sqrt(_SQRT_EPS):
                     update, contribution = _factor_update(
                         X, Y, z, mus[nz].T, noise_root, positive_noise, calc_ll)
                 else:
@@ -274,6 +295,14 @@ class TEnKF(object):
                         contribution = logpdf(x=y, mean=np.zeros(dim_z), cov=S)
                     update = X_bar @ Y_bar.T @ inverse @ (ZZ - Y - mus[nz].T)
                 updated = None
+                # Compare the rounding scale of the uncentered observation
+                # forecasts to the measurement noise in the same physical units.
+                resolution = noise_scale
+                if not positive_noise:
+                    # For a noiseless observation, compare with the predicted
+                    # spread. A shared large intercept can erase that spread.
+                    resolution = np.where(noise_scale > 0, noise_scale, np.sqrt(np.maximum(S.diagonal(), 0)))
+                large_forecast = np.any(_SQRT_EPS * np.max(abs(Y), axis=1) > resolution)
                 retry = update is _RETRY_IN_HIGH_PRECISION
                 if update is not None and not retry:
                     updated = X + update
@@ -281,6 +310,7 @@ class TEnKF(object):
                     # member's posterior state even in a scalar observation.
                     retry = (not np.isfinite(updated).all()
                              or np.any(np.abs(updated) < _SQRT_EPS * np.abs(X)))
+                retry |= large_forecast
                 if retry:
                     self.precision_requests += 1
                     if self.fallback_decimal_digits is None:
@@ -291,8 +321,13 @@ class TEnKF(object):
                     self.high_precision_updates += 1
                     started = perf_counter()
                     try:
+                        px, py = X, Y
+                        if forecast_again is not None:
+                            px, py = forecast_again(prior_members, epss[nz])
+                            if np.shape(px) != X.shape or np.shape(py) != Y.shape:
+                                raise ValueError("Incorrect dimensions returned by precise_forecast.")
                         updated, contribution = precise_update(
-                            X, Y, z, mus[nz].T, self.R, positive_noise, calc_ll, self.fallback_decimal_digits)
+                            px, py, z, mus[nz].T, self.R, positive_noise, calc_ll, self.fallback_decimal_digits)
                     except (ValueError, ZeroDivisionError) as exc:
                         raise ForecastNumericalError(
                             f"Ensemble update at observation {nz} failed at "

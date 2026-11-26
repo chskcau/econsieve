@@ -9,6 +9,63 @@ from mpmath import mp
 from econsieve import ForecastPrecisionRequired, TEnKF
 
 
+def test_precise_forecast_retains_information_lost_at_float64_boundary():
+    # Three members y=(a*x, a*x+1), x=(-1,0,1). R=I. The orthogonal
+    # forecast difference is exactly one even when a binary64 ULP exceeds one.
+    ctx = mp.clone()
+    ctx.dps = 200
+    a = 2**60
+    initial = np.array([[-1., 0., 1.]])
+    noise = np.array([[0.25, -.5], [.75, .125], [-.25, .5]])
+    seen = []
+
+    def precise(states, shocks):
+        seen.append((states.copy(), shocks.copy()))
+        q = np.array([[ctx.mpf(v) for v in states[0]]], dtype=object)
+        return q, np.concatenate((a*q, a*q+1))
+
+    def fast(state, shock):
+        y = float(a) * state[0]
+        return (state, np.array([y, y + 1.])), 0
+
+    f = TEnKF(3, 1, 2, fx=fast)
+    f.Q = np.eye(1)
+    f.multivariate = lambda mean, cov, size, **kw: (noise if cov is f.R else initial.T)[None]
+    z = np.array([[1., 3.]])
+    terms = np.empty(1)
+    ll = f.batch_filter(z, init_states=initial, calc_ll=True, store=True,
+                        ll_contributions=terms, precise_forecast=precise)
+    # Cov(y) + I has eigenvalues 1 and 2*a**2+1 with mean (0,1).
+    v = 2*a**2 + 1
+    expected = -np.log(2*np.pi) - (np.log(float(v)) + .5 + 4.5/v)/2
+    assert ll == pytest.approx(expected, abs=1e-12)
+    assert terms[0] == ll
+    np.testing.assert_allclose(f.Xs[0], (initial + a * (3 - noise.sum(axis=1))) / float(v),
+                               rtol=1e-14, atol=0)
+    assert len(seen) == 1
+    np.testing.assert_array_equal(seen[0][0], initial)
+    np.testing.assert_array_equal(seen[0][1], initial.T)
+
+
+def test_noiseless_scalar_forecast_with_large_intercept_and_small_spread():
+    ctx = mp.clone()
+    ctx.dps = 200
+    level = 2**57
+    offsets = np.array([-31., 1., 31.])
+
+    def precise(states, shocks):
+        return states, np.array([[ctx.mpf(level) + float(x) for x in shocks[:, 0]]], dtype=object)
+
+    f = TEnKF(3, 1, 1, fx=lambda state, eps: ((state, level+eps), 0), precise_forecast=precise)
+    f.R[:] = 0.
+    f.multivariate = lambda m, cov, s, **kw: (offsets if cov is f.Q else np.zeros(3)).reshape(1, 3, 1)
+    actual = f.batch_filter(np.array([[float(level)]]), init_states=np.ones((1, 3)), calc_ll=True)
+    variance = offsets.var(ddof=1)
+    expected = -.5 * (np.log(2*np.pi*variance) + offsets.mean()**2/variance)
+    assert actual == pytest.approx(expected, abs=1e-12)
+    assert f.high_precision_completed == 1
+
+
 def reference_update(states, forecasts, observation, perturbations, covariance):
     """Condition the empirical joint Gaussian at 200 decimal digits."""
     with mp.workdps(200):

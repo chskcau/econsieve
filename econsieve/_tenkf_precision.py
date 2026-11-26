@@ -50,11 +50,11 @@ def _whitener(ctx, covariance, innovation, observation, mean, members, positive_
 
 
 def precise_update(X, Y, z, noise, R, positive_noise, calc_ll, digits):
-    """Recompute from the uncentered binary inputs, rounding only the final results."""
+    """Condition the original inputs, retaining any extended-precision forecast values."""
     ctx = mp.clone()
     ctx.dps = digits
     x, y, observation, perturbations, r = (
-        ctx.matrix(np.asarray(a, dtype=float).tolist()) for a in (X, Y, z, noise, R)
+        ctx.matrix(a.tolist()) for a in (X, Y, z, noise, R)
     )
     n = y.cols
     ones = ctx.ones(n, 1)
